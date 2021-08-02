@@ -35,6 +35,10 @@ package org.opensearch.index.translog;
 import org.apache.lucene.util.Counter;
 import org.opensearch.Assertions;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.unit.ByteSizeUnit;
+import org.opensearch.common.unit.ByteSizeValue;
+import org.opensearch.index.seqno.RetentionLease;
+import org.opensearch.index.seqno.RetentionLeases;
 import org.opensearch.index.seqno.SequenceNumbers;
 
 import java.io.IOException;
@@ -43,10 +47,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 public class TranslogDeletionPolicy {
 
     private final Map<Object, RuntimeException> openTranslogRef;
+    private Supplier<RetentionLeases> retentionLeasesSupplier;
+    private static long LEASE_DEFAULT_RETENTION_SIZE = 512;
 
     public void assertNoOpenTranslogRefs() {
         if (openTranslogRef.isEmpty() == false) {
@@ -69,6 +76,8 @@ public class TranslogDeletionPolicy {
 
     private int retentionTotalFiles;
 
+    private boolean shouldPruneTranslogByRetentionLease;
+
     public TranslogDeletionPolicy(long retentionSizeInBytes, long retentionAgeInMillis, int retentionTotalFiles) {
         this.retentionSizeInBytes = retentionSizeInBytes;
         this.retentionAgeInMillis = retentionAgeInMillis;
@@ -78,6 +87,12 @@ public class TranslogDeletionPolicy {
         } else {
             openTranslogRef = null;
         }
+    }
+
+    public TranslogDeletionPolicy(long retentionSizeInBytes, long retentionAgeInMillis, int retentionTotalFiles,
+                                  Supplier<RetentionLeases> retentionLeasesSupplier) {
+        this(retentionSizeInBytes, retentionAgeInMillis, retentionTotalFiles);
+        this.retentionLeasesSupplier = retentionLeasesSupplier;
     }
 
     public synchronized void setLocalCheckpointOfSafeCommit(long newCheckpoint) {
@@ -98,6 +113,11 @@ public class TranslogDeletionPolicy {
 
     synchronized void setRetentionTotalFiles(int retentionTotalFiles) {
         this.retentionTotalFiles = retentionTotalFiles;
+    }
+
+    public synchronized void shouldPruneTranslogByRetentionLease(boolean translogPruneByRetentionLease) {
+        this.shouldPruneTranslogByRetentionLease = translogPruneByRetentionLease;
+        this.retentionSizeInBytes = Math.max(retentionSizeInBytes, new ByteSizeValue(LEASE_DEFAULT_RETENTION_SIZE, ByteSizeUnit.MB).getBytes());
     }
 
     /**
@@ -157,6 +177,12 @@ public class TranslogDeletionPolicy {
         long minByLocks = getMinTranslogGenRequiredByLocks();
         long minByAge = getMinTranslogGenByAge(readers, writer, retentionAgeInMillis, currentTime());
         long minBySize = getMinTranslogGenBySize(readers, writer, retentionSizeInBytes);
+        long minByRetentionLeasesAndSize = Long.MAX_VALUE;
+        if(shouldPruneTranslogByRetentionLease) {
+            // If retention size is specified, size takes precedence.
+            long minByRetentionLeases = getMinTranslogGenByRetentionLease(readers, writer, retentionLeasesSupplier);
+            minByRetentionLeasesAndSize = Math.max(minBySize, minByRetentionLeases);
+        }
         final long minByAgeAndSize;
         if (minBySize == Long.MIN_VALUE && minByAge == Long.MIN_VALUE) {
             // both size and age are disabled;
@@ -165,7 +191,28 @@ public class TranslogDeletionPolicy {
             minByAgeAndSize = Math.max(minByAge, minBySize);
         }
         long minByNumFiles = getMinTranslogGenByTotalFiles(readers, writer, retentionTotalFiles);
-        return Math.min(Math.max(minByAgeAndSize, minByNumFiles), minByLocks);
+        long minByTranslogGenSettings = Math.min(Math.max(minByAgeAndSize, minByNumFiles), minByLocks);
+        return Math.min(minByTranslogGenSettings, minByRetentionLeasesAndSize);
+    }
+
+    static long getMinTranslogGenByRetentionLease(List<TranslogReader> readers, TranslogWriter writer,
+                                                  Supplier<RetentionLeases> retentionLeasesSupplier) {
+        long minGen = writer.getGeneration();
+        final long minimumRetainingSequenceNumber = retentionLeasesSupplier.get()
+            .leases()
+            .stream()
+            .mapToLong(RetentionLease::retainingSequenceNumber)
+            .min()
+            .orElse(Long.MAX_VALUE);
+
+        for (int i = readers.size() - 1; i >= 0; i--) {
+            final TranslogReader reader = readers.get(i);
+            if(reader.getCheckpoint().minSeqNo <= minimumRetainingSequenceNumber &&
+                reader.getCheckpoint().maxSeqNo >= minimumRetainingSequenceNumber) {
+                minGen = Math.min(minGen, reader.getGeneration());
+            }
+        }
+        return minGen;
     }
 
     static long getMinTranslogGenBySize(List<TranslogReader> readers, TranslogWriter writer, long retentionSizeInBytes) {
