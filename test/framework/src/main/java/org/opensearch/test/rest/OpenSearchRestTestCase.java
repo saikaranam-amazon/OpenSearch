@@ -927,8 +927,13 @@ public abstract class OpenSearchRestTestCase extends OpenSearchTestCase {
         if (settings.getAsBoolean(IndexSettings.INDEX_SOFT_DELETES_SETTING.getKey(), true) == false) {
             expectSoftDeletesWarning(request, name);
         } else if (settings.hasValue(IndexSettings.INDEX_TRANSLOG_RETENTION_AGE_SETTING.getKey()) ||
-            settings.hasValue(IndexSettings.INDEX_TRANSLOG_RETENTION_SIZE_SETTING.getKey())) {
-            expectTranslogRetentionWarning(request);
+            settings.hasValue(IndexSettings.INDEX_TRANSLOG_RETENTION_SIZE_SETTING.getKey()) ||
+            settings.hasValue(IndexSettings.INDEX_PLUGINS_REPLICATION_TRANSLOG_RETENTION_LEASE_PRUNING_ENABLED_SETTING.getKey())) {
+            if (settings.hasValue(IndexSettings.INDEX_PLUGINS_REPLICATION_TRANSLOG_RETENTION_LEASE_PRUNING_ENABLED_SETTING.getKey())) {
+                expectTranslogPruningBasedOnRetentionLeaseWarning(request);
+            } else {
+                expectTranslogRetentionWarning(request);
+            }
         }
         request.setJsonEntity(entity);
         client().performRequest(request);
@@ -985,6 +990,20 @@ public abstract class OpenSearchRestTestCase extends OpenSearchTestCase {
             requestOptions.setWarningsHandler(warnings -> warnings.equals(expectedWarnings) == false);
             request.setOptions(requestOptions);
         } else if (nodeVersions.stream().anyMatch(version -> version.onOrAfter(LegacyESVersion.V_7_7_0))) {
+            requestOptions.setWarningsHandler(warnings -> warnings.isEmpty() == false && warnings.equals(expectedWarnings) == false);
+            request.setOptions(requestOptions);
+        }
+    }
+
+    protected static void expectTranslogPruningBasedOnRetentionLeaseWarning(Request request) {
+        final List<String> expectedWarnings = Collections.singletonList(
+            "[index.plugins.replication.translog.retention_lease.pruning.enabled] setting was deprecated in OpenSearch " +
+                "and will be removed in a future release! See the breaking changes documentation for the next major version.");
+        final Builder requestOptions = RequestOptions.DEFAULT.toBuilder();
+        if (nodeVersions.stream().allMatch(version -> version.onOrAfter(Version.V_1_1_0))) {
+            requestOptions.setWarningsHandler(warnings -> warnings.equals(expectedWarnings) == false);
+            request.setOptions(requestOptions);
+        } else if (nodeVersions.stream().anyMatch(version -> version.onOrAfter(Version.V_1_1_0))) {
             requestOptions.setWarningsHandler(warnings -> warnings.isEmpty() == false && warnings.equals(expectedWarnings) == false);
             request.setOptions(requestOptions);
         }
